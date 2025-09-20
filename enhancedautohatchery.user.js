@@ -2,7 +2,7 @@
 // @name          [Pokeclicker] Enhanced Auto Hatchery
 // @namespace     Pokeclicker Scripts
 // @author        Ephenia (Original/Credit: Drak + Ivan Lay, Optimatum)
-// @description   Auto-hatches eggs at 100% and adds controls: Auto Hatch, PKRS Mode, Auto Egg, Auto Fossil, Shiny Fossils, Filter Only, and a Priority ID queue (e.g., 149,123,552).
+// @description   Auto-hatches eggs at 100% and adds controls: Auto Hatch, PKRS Mode, Auto Egg, Auto Fossil, Shiny Fossils, Filter Only, and a Priority ID queue (e.g., 149,123,552,479.01) supporting alternate forms.
 // @copyright     https://github.com/Ephenia
 // @license       GPL-3.0 License
 // @version       3.3.0-priority
@@ -62,7 +62,7 @@ function initAutoHatch() {
     </button>
     <!-- Priority input controls -->
     <div id="priority-controls" style="display:inline-flex; align-items:center; margin-left:20px; gap:8px;">
-      <input id="priority-ids" type="text" inputmode="numeric" pattern="[0-9,\\s-]*" placeholder="Priority IDs e.g. 149,123,552" style="max-width:260px; padding:3px 6px; font-size:12px;">
+      <input id="priority-ids" type="text" inputmode="numeric" pattern="[0-9.,\\s-]*" placeholder="Priority IDs e.g. 149,123,552,479.01" style="max-width:260px; padding:3px 6px; font-size:12px;">
       <button id="priority-save" class="btn btn-primary btn-sm">Save Priority</button>
     </div>
     <span id="priority-status" style="margin-left:10px; font-size:12px; opacity:.8;"></span>
@@ -170,9 +170,9 @@ function renderPriorityUiFromStorage() {
 function savePriorityFromInput() {
     const input = document.getElementById('priority-ids');
     const status = document.getElementById('priority-status');
-    // Accept comma/space separated, tolerate extra chars
-    const parts = input.value.split(/[^0-9]+/).filter(Boolean);
-    const parsed = parts.map(n => Number(n)).filter(n => Number.isFinite(n) && n > 0);
+    // Accept comma/space separated, tolerate extra chars - now supports decimal IDs
+    const parts = input.value.split(/[^0-9.]+/).filter(Boolean);
+    const parsed = parts.map(n => Number(n)).filter(n => Number.isFinite(n) && n > 0 && !isNaN(n));
     // De-duplicate while preserving order
     const seen = new Set();
     priorityIdList = parsed.filter(n => (seen.has(n) ? false : (seen.add(n), true)));
@@ -195,11 +195,21 @@ function autoHatchPriority() {
     // We'll scan per priority to keep order strict.
     for (let id of priorityIdList) {
         // Find a hatchable party member whose dex ID matches
+        // Support both integer IDs (479) and decimal IDs (479.01) for alternate forms
         const mon = App.game.party.caughtPokemon.find(p => {
             if (!p || p.breeding || !p.isHatchable()) return false;
             // pokemonMap[p.name].id is available elsewhere in script (type was used earlier)
             const data = pokemonMap[p.name];
-            return data && data.id === id;
+            if (!data) return false;
+            
+            // Exact match for decimal IDs (e.g., 479.01)
+            if (data.id === id) return true;
+            
+            // For integer IDs, match both base forms and alternate forms
+            // This allows 479 to match both 479 (base) and 479.01, 479.02, etc. (alternates)
+            if (Number.isInteger(id) && Math.floor(data.id) === id) return true;
+            
+            return false;
         });
         if (mon) {
             return App.game.breeding.addPokemonToHatchery(mon);

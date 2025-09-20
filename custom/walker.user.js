@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name          [Pokeclicker] Route 10k Walker + Pokerus Walker
+// @name          [Pokeclicker] Route & Dungeon Walker + Pokerus Walker
 // @namespace     Pokeclicker Scripts
 // @author        goldhaxx
-// @description   Walks routes to reach 10,000 defeats per route, then picks the hardest route with >= 20 KO/s from your AutoClicker. Also includes Pokerus mode to walk routes checking for Pokemon that need Pokerus resistance.
+// @description   Walks routes to reach 10,000 defeats per route, then picks the hardest route with >= 20 KO/s from your AutoClicker. Also includes Pokerus mode to walk routes checking for Pokemon that need Pokerus resistance. Now includes dungeon modes for both clears (500 per dungeon) and Pokerus checking, with Enhanced Auto Clicker integration.
 // @license       MIT
-// @version       0.2.0
+// @version       0.4.0
 // @match         https://www.pokeclicker.com/
 // @icon          https://www.google.com/s2/favicons?domain=pokeclicker.com
 // @grant         unsafeWindow
@@ -18,14 +18,17 @@
       lastTarget: `${SCRIPT_KEY}:lastTarget`,
       mode: `${SCRIPT_KEY}:mode`,
     };
-    const TARGET_KILLS = 10000;
+    const TARGET_ROUTE_KILLS = 10000;
+    const TARGET_DUNGEON_CLEARS = 500;
     const REQUIRE_RATE = 20; // Pokémon per second
-    const LOOP_MS = 500;
+    const LOOP_MS = 50; // Main loop interval in milliseconds - controls how often the Walker checks for route/dungeon changes and updates
     
     // Walker modes
     const MODES = {
       ROUTE_10K: 'route10k',
-      POKERUS: 'pokerus'
+      POKERUS: 'pokerus',
+      DUNGEON_KILLS: 'dungeon_kills',
+      DUNGEON_POKERUS: 'dungeon_pokerus'
     };
   
     // --- Utilities ---
@@ -189,6 +192,203 @@
       }
       return null; // All routes have resistant Pokemon
     }
+
+    // --- Dungeon Functions ---
+    
+    function getAllAccessibleDungeons() {
+      // Get all unlocked dungeons from all regions
+      const dungeons = [];
+      const regions = Object.values(GameConstants.Region).filter((v) => Number.isInteger(v));
+      
+      for (const region of regions) {
+        if (!regionUnlocked(region)) continue;
+        
+        // Find dungeon towns in this region
+        const dungeonTowns = Object.values(TownList).filter((town) => 
+          town.region === region && 
+          town.constructor.name === 'DungeonTown' && 
+          town.dungeon != null
+        );
+        
+        for (const town of dungeonTowns) {
+          const dungeon = town.dungeon;
+          if (canAccessDungeon(dungeon)) {
+            dungeons.push({
+              dungeon: dungeon,
+              town: town,
+              region: region
+            });
+          }
+        }
+      }
+      
+      // Sort by region, then by dungeon name
+      dungeons.sort((a, b) => (a.region - b.region) || a.dungeon.name.localeCompare(b.dungeon.name));
+      return dungeons;
+    }
+    
+    function canAccessDungeon(dungeon) {
+      try {
+        return dungeon.isUnlocked() && 
+               App.game.wallet.currencies[GameConstants.Currency.dungeonToken]() >= dungeon.tokenCost;
+      } catch {
+        return false;
+      }
+    }
+    
+    function getDungeonClears(dungeon) {
+      try {
+        const dungeonIndex = GameConstants.getDungeonIndex(dungeon.name);
+        return App.game.statistics.dungeonsCleared[dungeonIndex]?.() ?? 0;
+      } catch {
+        return 0;
+      }
+    }
+    
+    function moveToDungeon(dungeonData) {
+      try {
+        if (App.game.gameState === GameConstants.GameState.town || 
+            App.game.gameState === GameConstants.GameState.fighting ||
+            App.game.gameState === GameConstants.GameState.dungeon) {
+          
+          // Move to the town first if not already there
+          if (!MapHelper.isTownCurrentLocation(dungeonData.town.name)) {
+            MapHelper.moveToTown(dungeonData.town.name);
+          } else {
+            // Already in the town, ensure Enhanced Auto Clicker Auto Dungeon is enabled
+            if (W.EnhancedAutoClicker && typeof W.EnhancedAutoClicker.toggleAutoDungeon === 'function') {
+              // Check if Auto Dungeon is not already running and enable it
+              if (!W.EnhancedAutoClicker.autoDungeonState()) {
+                console.log(`[Route10k] Activating Enhanced Auto Clicker Auto Dungeon for ${dungeonData.dungeon.name}`);
+                W.EnhancedAutoClicker.toggleAutoDungeon();
+              }
+            } else {
+              // Fallback: initialize the dungeon manually if Enhanced Auto Clicker not available
+              DungeonRunner.initializeDungeon(dungeonData.dungeon);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[Route10k] moveToDungeon error', e);
+      }
+    }
+    
+    function getDungeonPokemon(dungeon) {
+      try {
+        const pokemon = [];
+        
+        // Get enemy list Pokemon
+        if (dungeon.enemyList) {
+          for (const enemy of dungeon.enemyList) {
+            let pokemonName;
+            if (typeof enemy === 'string') {
+              pokemonName = enemy;
+            } else if (typeof enemy.pokemon === 'string') {
+              pokemonName = enemy.pokemon;
+            }
+            if (pokemonName && !pokemon.includes(pokemonName)) {
+              pokemon.push(pokemonName);
+            }
+          }
+        }
+        
+        // Get boss list Pokemon
+        if (dungeon.bossList) {
+          for (const boss of dungeon.bossList) {
+            let pokemonName;
+            if (boss.constructor && boss.constructor.name === 'DungeonBossPokemon') {
+              pokemonName = boss.name;
+            } else if (typeof boss === 'string') {
+              pokemonName = boss;
+            }
+            if (pokemonName && !pokemon.includes(pokemonName)) {
+              pokemon.push(pokemonName);
+            }
+          }
+        }
+        
+        return pokemon;
+      } catch {
+        return [];
+      }
+    }
+    
+    function checkDungeonPokerusStatus(dungeonData) {
+      try {
+        const dungeonMons = getDungeonPokemon(dungeonData.dungeon);
+        if (!dungeonMons.length) return { needsPokerus: false, total: 0, resistant: 0 };
+        
+        let total = 0;
+        let resistant = 0;
+        let needsPokerus = false;
+        
+        // Debug: log which Pokemon we're checking (only once per dungeon)
+        if (!dungeonData.debugLogged) {
+          console.log(`[Route10k] Checking dungeon ${dungeonData.dungeon.name} for Pokemon:`, dungeonMons);
+          dungeonData.debugLogged = true;
+        }
+        
+        for (const monName of dungeonMons) {
+          const pokemon = App.game.party.getPokemonByName(monName);
+          if (pokemon) {
+            total++;
+            // Check if Pokemon has resistant Pokerus (value 3)
+            if (pokemon.pokerus === GameConstants.Pokerus.Resistant) {
+              resistant++;
+            } else {
+              needsPokerus = true;
+            }
+          }
+        }
+        
+        return { needsPokerus, total, resistant };
+      } catch (e) {
+        console.warn('[Route10k] checkDungeonPokerusStatus error', e);
+        return { needsPokerus: false, total: 0, resistant: 0 };
+      }
+    }
+    
+    function findNextDungeonClears(dungeons) {
+      // Find the next dungeon that needs more clears
+      for (const dungeonData of dungeons) {
+        const clears = getDungeonClears(dungeonData.dungeon);
+        if (clears < TARGET_DUNGEON_CLEARS) {
+          return dungeonData;
+        }
+      }
+      return null; // All dungeons have enough clears
+    }
+    
+    function findNextDungeonPokerus(dungeons) {
+      // Find the next dungeon that has Pokemon needing Pokerus resistance
+      for (const dungeonData of dungeons) {
+        const status = checkDungeonPokerusStatus(dungeonData);
+        if (status.needsPokerus) {
+          return dungeonData;
+        }
+      }
+      return null; // All dungeons have resistant Pokemon
+    }
+    
+    function ensureAutoDungeonEnabled() {
+      // Ensure Enhanced Auto Clicker Auto Dungeon is enabled for dungeon modes
+      if (W.EnhancedAutoClicker && typeof W.EnhancedAutoClicker.toggleAutoDungeon === 'function') {
+        if (!W.EnhancedAutoClicker.autoDungeonState()) {
+          console.log('[Route10k] Enabling Enhanced Auto Clicker Auto Dungeon for dungeon mode');
+          W.EnhancedAutoClicker.toggleAutoDungeon();
+        }
+      }
+    }
+    
+    function ensureAutoDungeonDisabled() {
+      // Disable Enhanced Auto Clicker Auto Dungeon when switching away from dungeon modes
+      if (W.EnhancedAutoClicker && typeof W.EnhancedAutoClicker.toggleAutoDungeon === 'function') {
+        if (W.EnhancedAutoClicker.autoDungeonState()) {
+          console.log('[Route10k] Disabling Enhanced Auto Clicker Auto Dungeon for non-dungeon mode');
+          W.EnhancedAutoClicker.toggleAutoDungeon();
+        }
+      }
+    }
   
     // Optional: quick live probe to verify >= REQUIRE_RATE if EnhancedAutoClicker not present
     let probeState = null;
@@ -230,14 +430,29 @@
     let mode = localStorage.getItem(STORAGE.mode) ?? MODES.ROUTE_10K;
     let loopHandle = null;
     let currentTarget = null;
+    
+    function getModeDisplayText(mode) {
+      switch (mode) {
+        case MODES.POKERUS: return 'Pokerus';
+        case MODES.DUNGEON_KILLS: return 'Dungeon - Clears';
+        case MODES.DUNGEON_POKERUS: return 'Dungeon - PKRS';
+        default: return '10k Kills';
+      }
+    }
   
     function pickNextTarget(routes) {
       if (mode === MODES.POKERUS) {
         return findNextPokerusRoute(routes);
+      } else if (mode === MODES.DUNGEON_KILLS) {
+        const dungeons = getAllAccessibleDungeons();
+        return findNextDungeonClears(dungeons);
+      } else if (mode === MODES.DUNGEON_POKERUS) {
+        const dungeons = getAllAccessibleDungeons();
+        return findNextDungeonPokerus(dungeons);
       } else {
         // Next route with < 10k kills
         for (const r of routes) {
-          if (getKO(r) < TARGET_KILLS) return r;
+          if (getKO(r) < TARGET_ROUTE_KILLS) return r;
         }
         return null;
       }
@@ -275,20 +490,62 @@
           console.log('[Route10k] All Pokemon on all routes have Pokerus resistance!');
           return;
         }
+      } else if (mode === MODES.DUNGEON_KILLS) {
+        // Dungeon clears mode: find dungeons needing more clears
+        const need = pickNextTarget(routes);
+        if (need) {
+          // If we changed target, move there
+          if (!currentTarget || currentTarget.dungeon.name !== need.dungeon.name) {
+            currentTarget = need;
+            localStorage.setItem(STORAGE.lastTarget, JSON.stringify(currentTarget));
+            moveToDungeon(currentTarget);
+          } else {
+            // Already on target — if we somehow drifted, move back
+            if (player.town?.name !== currentTarget.town.name) {
+              moveToDungeon(currentTarget);
+            }
+          }
+          return;
+        } else {
+          // All dungeons have enough clears
+          console.log('[Route10k] All dungeons have reached the target clear count!');
+          return;
+        }
+      } else if (mode === MODES.DUNGEON_POKERUS) {
+        // Dungeon Pokerus mode: find dungeons with Pokemon needing resistance
+        const need = pickNextTarget(routes);
+        if (need) {
+          // If we changed target, move there
+          if (!currentTarget || currentTarget.dungeon.name !== need.dungeon.name) {
+            currentTarget = need;
+            localStorage.setItem(STORAGE.lastTarget, JSON.stringify(currentTarget));
+            moveToDungeon(currentTarget);
+          } else {
+            // Already on target — if we somehow drifted, move back
+            if (player.town?.name !== currentTarget.town.name) {
+              moveToDungeon(currentTarget);
+            }
+          }
+          return;
+        } else {
+          // All Pokemon in all dungeons are resistant
+          console.log('[Route10k] All Pokemon in all dungeons have Pokerus resistance!');
+          return;
+        }
         
-        // Continuous monitoring for Pokerus mode
-        if (currentTarget) {
-          // Check if current route is complete (all Pokemon resistant)
-          const currentStatus = checkRoutePokerusStatus(currentTarget);
+        // Continuous monitoring for dungeon Pokerus mode
+        if (currentTarget && mode === MODES.DUNGEON_POKERUS) {
+          // Check if current dungeon is complete (all Pokemon resistant)
+          const currentStatus = checkDungeonPokerusStatus(currentTarget);
           if (!currentStatus.needsPokerus) {
-            // Current route is complete, find next route
-            console.log(`[Route10k] Route ${currentTarget.region}-${currentTarget.number} complete! All Pokemon are resistant.`);
+            // Current dungeon is complete, find next dungeon
+            console.log(`[Route10k] Dungeon ${currentTarget.dungeon.name} complete! All Pokemon are resistant.`);
             currentTarget = null;
             localStorage.removeItem(STORAGE.lastTarget);
           } else {
             // Log progress every 10 seconds (every 20 loops at 500ms interval)
             if (!currentTarget.progressLogTime || Date.now() - currentTarget.progressLogTime > 10000) {
-              console.log(`[Route10k] Route ${currentTarget.region}-${currentTarget.number}: ${currentStatus.resistant}/${currentStatus.total} Pokemon resistant`);
+              console.log(`[Route10k] Dungeon ${currentTarget.dungeon.name}: ${currentStatus.resistant}/${currentStatus.total} Pokemon resistant`);
               currentTarget.progressLogTime = Date.now();
             }
           }
@@ -359,11 +616,13 @@
                 <div style="flex: initial; display: flex; flex-direction: column;">
                     <div id="route10kwalker-mode-dropdown" class="dropdown show">
                         <button type="button" class="text-left custom-select col-12 btn btn-dropdown" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="max-height:30px; display:flex; flex:1; align-items:center;">
-                            <span id="route10kwalker-mode-text" style="font-size: 8pt;">${mode === MODES.POKERUS ? 'Pokerus' : '10k Kills'}</span>
+                            <span id="route10kwalker-mode-text" style="font-size: 8pt;">${getModeDisplayText(mode)}</span>
                         </button>
                         <div id="route10kwalker-mode-dropdown-menu" class="border-secondary dropdown-menu col-12">
                             <div class="dropdown-item" value="${MODES.ROUTE_10K}">10k Kills</div>
                             <div class="dropdown-item" value="${MODES.POKERUS}">Pokerus</div>
+                            <div class="dropdown-item" value="${MODES.DUNGEON_KILLS}">Dungeon - Clears</div>
+                            <div class="dropdown-item" value="${MODES.DUNGEON_POKERUS}">Dungeon - PKRS</div>
                         </div>
                     </div>
                 </div>
@@ -381,11 +640,23 @@
         btn.classList.remove('btn-success', 'btn-danger');
         btn.classList.add(enabled ? 'btn-success' : 'btn-danger');
         btn.textContent = `Route Walker [${enabled ? 'ON' : 'OFF'}]`;
+        
+        // Handle Auto Dungeon enabling/disabling based on Walker state
+        const isDungeonMode = (mode === MODES.DUNGEON_KILLS || mode === MODES.DUNGEON_POKERUS);
+        
         if (enabled && !loopHandle) {
           loopHandle = setInterval(mainLoop, LOOP_MS);
+          // Enable Auto Dungeon if Walker is enabled and in dungeon mode
+          if (isDungeonMode) {
+            ensureAutoDungeonEnabled();
+          }
         } else if (!enabled && loopHandle) {
           clearInterval(loopHandle);
           loopHandle = null;
+          // Disable Auto Dungeon if Walker is disabled and was in dungeon mode
+          if (isDungeonMode) {
+            ensureAutoDungeonDisabled();
+          }
         }
       });
   
@@ -394,9 +665,22 @@
         elem.addEventListener('click', () => {
           const newMode = elem.getAttribute('value');
           if (newMode !== mode) {
+            const oldMode = mode;
             mode = newMode;
             localStorage.setItem(STORAGE.mode, mode);
-            document.getElementById('route10kwalker-mode-text').textContent = mode === MODES.POKERUS ? 'Pokerus' : '10k Kills';
+            document.getElementById('route10kwalker-mode-text').textContent = getModeDisplayText(mode);
+            
+            // Handle Auto Dungeon enabling/disabling based on mode changes
+            const isDungeonMode = (mode === MODES.DUNGEON_KILLS || mode === MODES.DUNGEON_POKERUS);
+            const wasDungeonMode = (oldMode === MODES.DUNGEON_KILLS || oldMode === MODES.DUNGEON_POKERUS);
+            
+            if (isDungeonMode && !wasDungeonMode) {
+              // Switching to dungeon mode - enable Auto Dungeon
+              ensureAutoDungeonEnabled();
+            } else if (!isDungeonMode && wasDungeonMode) {
+              // Switching away from dungeon mode - disable Auto Dungeon
+              ensureAutoDungeonDisabled();
+            }
             
             // Reset current target when switching modes
             currentTarget = null;
@@ -424,12 +708,17 @@
       try {
         addButton();
         if (enabled && !loopHandle) loopHandle = setInterval(mainLoop, LOOP_MS);
-  
+
         // Restore last target (optional; harmless if no longer accessible)
         try {
           const saved = localStorage.getItem(STORAGE.lastTarget);
           if (saved) currentTarget = JSON.parse(saved);
         } catch { /* ignore */ }
+        
+        // Ensure Auto Dungeon is enabled if Walker is enabled and in dungeon mode
+        if (enabled && (mode === MODES.DUNGEON_KILLS || mode === MODES.DUNGEON_POKERUS)) {
+          ensureAutoDungeonEnabled();
+        }
       } catch (e) {
         console.error('[Route10k] init error', e);
         Notifier?.notify?.({
